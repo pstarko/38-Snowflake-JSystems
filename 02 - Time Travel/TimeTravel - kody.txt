@@ -1,0 +1,297 @@
+--Krok 1
+-- Tworzenie bazy danych i schematu
+CREATE DATABASE IF NOT EXISTS WAREHOUSE_WORKSHOP;
+USE DATABASE WAREHOUSE_WORKSHOP;
+CREATE SCHEMA IF NOT EXISTS INVENTORY;
+USE SCHEMA INVENTORY;
+
+
+--Krok 2
+-- Tabela główna z produktami
+CREATE OR REPLACE TABLE products (
+    product_id INT,
+    product_name VARCHAR(100),
+    category VARCHAR(50),
+    quantity INT,
+    price DECIMAL(10,2),
+    last_updated TIMESTAMP,
+    load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Tabela logów aktualizacji
+CREATE OR REPLACE TABLE update_logs (
+    log_id INT AUTOINCREMENT,
+    operation_type VARCHAR(20),
+    product_id INT,
+    old_quantity INT,
+    new_quantity INT,
+    update_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    task_run_id VARCHAR(100)
+);
+
+-- Tabela staging dla nowych danych
+CREATE OR REPLACE TABLE products_staging (
+    product_id INT,
+    product_name VARCHAR(100),
+    category VARCHAR(50),
+    quantity INT,
+    price DECIMAL(10,2),
+    last_updated TIMESTAMP,
+    load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+--Krok 3
+/*
+Stream to obiekt, który śledzi zmiany w tabeli (INSERT, UPDATE, DELETE) od momentu jego ostatniego odczytu. 
+To mechanizm CDC (Change Data Capture): zamiast co noc przetwarzać całą tabelę, przetwarzasz tylko to, co się zmieniło.
+
+Stream nie przechowuje kopii danych. Zapamiętuje tylko offset, czyli punkt w historii wersji tabeli, a przy odczycie Snowflake porównuje bieżący stan z tym punktem.
+
+Najważniejsze funkcjonalności
+
+1. Kolumny metadanych. Zapytanie do streamu zwraca kolumny tabeli źródłowej oraz trzy dodatkowe:
+
+    METADATA$ACTION: INSERT albo DELETE
+    METADATA$ISUPDATE: TRUE, jeśli wiersz jest częścią UPDATE. Update jest reprezentowany jako para DELETE (stara wersja) + INSERT (nowa wersja).
+    METADATA$ROW_ID: niezmienny identyfikator wiersza, pozwala śledzić ten sam wiersz w kolejnych zmianach.
+
+2. Zmiany netto, nie pełna historia. 
+    Stream pokazuje różnicę między offsetem a stanem obecnym. 
+    Jeśli wiersz został wstawiony, a potem usunięty przed odczytem, nie pojawi się wcale. 
+    Jeśli był zmieniany trzy razy, zobaczysz tylko stan końcowy.
+
+3. Konsumpcja i przesuwanie offsetu. 
+    Zwykły SELECT ze streamu nie przesuwa offsetu, więc możesz go podglądać dowolnie często. 
+    Offset przesuwa się dopiero, gdy użyjesz streamu w poleceniu DML (INSERT, MERGE, UPDATE…), które zostanie zatwierdzone. 
+    Wtedy stream się „opróżnia”. W jawnej transakcji wszystkie odczyty widzą ten sam stan, co daje spójność przy kilku krokach.
+
+4. Typy streamów:
+    Standard (domyślny): śledzi INSERT, UPDATE, DELETE i TRUNCATE.
+    Append-only: tylko wstawienia. Jest szybszy, idealny do tabel typu log czy event, ładowanych z plików.
+    Insert-only: dla tabel zewnętrznych (external tables) i tabel Iceberg, śledzi nowo dodane pliki.
+
+5. Różne obiekty źródłowe. 
+    Stream można założyć nie tylko na zwykłej tabeli, ale też na widoku (także secure view), tabeli dynamicznej, tabeli zewnętrznej czy directory table stage'a. 
+    Ta ostatnia przydaje się do wykrywania nowych plików.
+
+6. Współpraca z TASK. 
+    Typowy wzorzec automatyzacji to task uruchamiany co kilka minut, który działa tylko wtedy, gdy są zmiany:
+    CREATE TASK przetworz_zmiany
+      WAREHOUSE = COMPUTE_WH
+      SCHEDULE = '5 MINUTE'
+      WHEN SYSTEM$STREAM_HAS_DATA('ZAMOWIENIA_STREAM')
+    AS
+      MERGE INTO ZAMOWIENIA_HIST t
+      USING ZAMOWIENIA_STREAM s ON t.ID = s.ID
+      WHEN MATCHED AND s.METADATA$ACTION = 'DELETE' AND NOT s.METADATA$ISUPDATE THEN DELETE
+      WHEN MATCHED AND s.METADATA$ACTION = 'INSERT' THEN UPDATE SET t.KWOTA = s.KWOTA
+      WHEN NOT MATCHED AND s.METADATA$ACTION = 'INSERT' THEN INSERT (ID, KWOTA) VALUES (s.ID, s.KWOTA);
+
+Warunek WHEN SYSTEM$STREAM_HAS_DATA sprawia, że gdy nie ma zmian, task się pomija i nie uruchamia warehouse'u, więc nie płacisz za puste przebiegi.
+
+7. Wiele niezależnych streamów. 
+    Na jednej tabeli możesz mieć kilka streamów, każdy z własnym offsetem. Na przykład jeden dla hurtowni, drugi dla procesu audytu. 
+    Konsumpcja jednego nie wpływa na drugi.
+
+8. Opcje przy tworzeniu:
+    SHOW_INITIAL_ROWS = TRUE: pierwszy odczyt zwróci wszystkie istniejące wiersze, co przydaje się do początkowego załadowania.
+    AT / BEFORE (Time Travel): stream może zacząć śledzenie od punktu w przeszłości.
+
+9. Przeterminowanie (staleness). 
+    Stream polega na historii wersji tabeli. Jeśli nie zostanie skonsumowany przez czas dłuższy niż okres retencji danych, stanie się stale i trzeba go utworzyć od nowa. 
+    Snowflake automatycznie wydłuża retencję dla tabel ze streamami, domyślnie do 14 dni (parametr MAX_DATA_EXTENSION_TIME_IN_DAYS). 
+    Stan sprawdzisz kolumnami stale i stale_after w wyniku SHOW STREAMS.
+*/
+
+
+-- Stream do monitorowania zmian w tabeli products
+CREATE OR REPLACE STREAM products_stream ON TABLE products
+APPEND_ONLY = FALSE;
+
+-- Sprawdzenie struktury stream
+DESC STREAM products_stream;
+
+--KROK 4
+CREATE OR REPLACE STAGE warsztat4_csv_stage;
+
+--Dodaj tam plik: warehouse_products_initial.csv oraz warehouse_products_update.csv
+
+COPY INTO products_staging (
+  product_id,
+  product_name,
+  category,
+  quantity,
+  price,
+  last_updated
+)
+FROM @warsztat4_csv_stage/warehouse_products_initial.csv
+FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY='"' SKIP_HEADER=1)
+ON_ERROR = 'ABORT_STATEMENT';
+
+select * from products_staging;
+
+-- Przeniesienie danych do tabeli głównej
+INSERT INTO products 
+SELECT product_id, product_name, category, quantity, price, last_updated, current_timestamp()
+FROM products_staging;
+
+-- Sprawdzenie danych
+SELECT * FROM products ORDER BY product_id;
+
+
+--KROK 5
+--UWAGA – trzeba stworzyć zwykły VIEW nie zmaterializowany (TT nie działa na MV)
+
+CREATE OR REPLACE VIEW products_5min_ago AS
+SELECT 
+    product_id,
+    product_name,
+    category,
+    quantity,
+    price,
+    last_updated,
+    load_timestamp
+FROM products 
+AT(OFFSET => -60); -- 60 sekund = 1 minuta
+
+-- Sprawdzenie View (po 60 sekundach)
+SELECT * FROM products_5min_ago ORDER BY product_id;
+
+
+--KROK 6: Procedura aktualizacji danych 
+CREATE OR REPLACE PROCEDURE process_new_products()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    task_id STRING DEFAULT 'TASK_' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDDHH24MISS');
+    rows_processed INT DEFAULT 0;
+BEGIN  
+    
+    -- Załadowanie nowych danych (symulacja)    
+    -- Aktualizacja istniejących produktów i dodanie nowych
+    MERGE INTO products p
+    USING products_staging s ON p.product_id = s.product_id
+    WHEN MATCHED AND (p.quantity != s.quantity OR p.price != s.price) THEN
+        UPDATE SET 
+            quantity = s.quantity,
+            price = s.price,
+            last_updated = s.last_updated,
+            load_timestamp = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN
+        INSERT (product_id, product_name, category, quantity, price, last_updated)
+        VALUES (s.product_id, s.product_name, s.category, s.quantity, s.price, s.last_updated);
+    
+    rows_processed := SQLROWCOUNT;
+
+    -- Czyszczenie staging
+    DELETE FROM products_staging;
+    
+    RETURN 'Processed ' || rows_processed || ' rows with task_id: ' || task_id;
+END;
+$$;
+
+--KROK 7: Task do automatycznego przetwarzania
+
+-- nie można IFa mieć w Tasku + nie można 2 poleceń uruchomić w tasku
+
+CREATE OR REPLACE TASK warehouse_update_task
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = 'USING CRON 0/1 * * * * UTC'
+  COMMENT = 'Aktualizacja danych magazynowych co 1 minutę'
+AS
+INSERT INTO update_logs (operation_type, product_id, old_quantity, new_quantity, task_run_id)
+SELECT 
+  METADATA$ACTION AS operation_type,
+  product_id,
+  CASE WHEN METADATA$ACTION = 'DELETE' THEN quantity ELSE NULL END AS old_quantity,
+  CASE WHEN METADATA$ACTION = 'INSERT' THEN quantity ELSE NULL END AS new_quantity,
+  'TASK_' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDDHH24MISS') AS task_run_id
+FROM products_stream;
+
+--2
+CREATE OR REPLACE TASK warehouse_update_task2
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = 'USING CRON 0/1 * * * * UTC'
+  COMMENT = 'Aktualizacja danych magazynowych co 1 minut'
+AS
+CALL process_new_products();
+
+-- Uruchomienie task
+ALTER TASK warehouse_update_task RESUME;
+
+select * from update_logs;
+
+select * from products;
+
+insert into products values (11, 'Monitor dodatkowy', 'Electronics',1, 4300, current_timestamp(), current_timestamp());
+
+execute task warehouse_update_task;
+execute task warehouse_update_task2;
+
+select * from update_logs;
+
+select * from products;
+select * from products_staging;
+
+insert into products_staging values (14, 'Monitor dodatkowy2', 'Electronics',2, 4500, current_timestamp(), current_timestamp());
+
+--CALL process_new_products();
+
+--Krok 8
+-- Sprawdzenie aktualnego stanu
+SELECT 'CURRENT' as time_point, COUNT(*) as product_count, SUM(quantity) as total_quantity 
+FROM products
+UNION ALL
+-- Stan sprzed 1 godziny
+SELECT 'HOUR_AGO' as time_point, COUNT(*) as product_count, SUM(quantity) as total_quantity 
+FROM products AT(OFFSET => -600)
+UNION ALL
+-- Stan z konkretnego czasu
+SELECT 'SPECIFIC_TIME' as time_point, COUNT(*) as product_count, SUM(quantity) as total_quantity 
+FROM products AT(TIMESTAMP => '2026-03-23 17:00:00'::TIMESTAMP);
+
+
+
+SELECT 
+    product_id,
+    quantity,
+    load_timestamp,
+    'CURRENT' as version
+FROM products WHERE product_id = 1
+UNION ALL
+SELECT 
+    product_id,
+    quantity,
+    load_timestamp,
+    'HOUR_AGO' as version
+FROM products AT(OFFSET => -3600) WHERE product_id = 1;
+
+
+--Krok 9
+-- Sprawdzenie logów aktualizacji
+SELECT * FROM update_logs ORDER BY update_timestamp DESC;
+
+-- Porównanie aktualnego stanu z stanem sprzed 5 minut
+SELECT 
+    c.product_name,
+    c.quantity as current_quantity,
+    h.quantity as quantity_5min_ago,
+    (c.quantity - h.quantity) as change
+FROM products c
+LEFT JOIN products_5min_ago h ON c.product_id = h.product_id
+WHERE c.quantity != h.quantity OR h.quantity IS NULL;
+
+-- Sprawdzenie działania stream
+SELECT * FROM products_stream;
+
+-- Status task
+SHOW TASKS LIKE 'warehouse_update_task';
+SELECT * FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY()) 
+WHERE NAME = 'WAREHOUSE_UPDATE_TASK' 
+ORDER BY SCHEDULED_TIME DESC LIMIT 10;
+
+
+--Czyszczenie
+DROP DATABASE WAREHOUSE_WORKSHOP;
