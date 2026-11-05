@@ -1,0 +1,49 @@
+--Tworzenie użytkowników
+
+-- 1. Role
+USE ROLE USERADMIN;
+CREATE ROLE IF NOT EXISTS HR_ROLE;
+CREATE ROLE IF NOT EXISTS SPRZEDAZ_ROLE;
+
+-- 2. Użytkownicy
+CREATE USER anna_hr
+    PASSWORD = 'TymczasoweHaslo#2026a'
+    DEFAULT_ROLE = HR_ROLE
+    DEFAULT_WAREHOUSE = COMPUTE_WH
+    MUST_CHANGE_PASSWORD = TRUE;
+
+CREATE USER jasiu_sprzedaz
+    PASSWORD = 'TymczasoweHaslo#2026b'
+    DEFAULT_ROLE = SPRZEDAZ_ROLE
+    DEFAULT_WAREHOUSE = COMPUTE_WH
+    MUST_CHANGE_PASSWORD = TRUE;
+
+-- 3. Przypisanie ról
+USE ROLE SECURITYADMIN;
+GRANT ROLE HR_ROLE       TO USER anna_hr;
+GRANT ROLE SPRZEDAZ_ROLE TO USER jasiu_sprzedaz;
+
+-- dobra praktyka: role trafiają do hierarchii pod SYSADMIN
+GRANT ROLE HR_ROLE       TO ROLE SYSADMIN;
+GRANT ROLE SPRZEDAZ_ROLE TO ROLE SYSADMIN;
+
+-- 4. Minimalne uprawnienia, żeby mogli cokolwiek zrobić
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE HR_ROLE;
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE SPRZEDAZ_ROLE;
+GRANT USAGE ON DATABASE STARKOTEST TO ROLE HR_ROLE;
+GRANT USAGE ON DATABASE STARKOTEST TO ROLE SPRZEDAZ_ROLE;
+GRANT USAGE ON SCHEMA STARKOTEST.PUBLIC TO ROLE HR_ROLE;
+GRANT USAGE ON SCHEMA STARKOTEST.PUBLIC TO ROLE SPRZEDAZ_ROLE;
+
+/*
+Potem nadajesz konkretne uprawnienia do tabel, 
+np. GRANT SELECT ON TABLE klienci TO ROLE HR_ROLE;. 
+
+
+Kilka uwag:
+
+	Login nie rozróżnia wielkości liter, ale CURRENT_USER() zwróci ANNA_HR i JASIU_SPRZEDAZ. Tak też wpisuj ich w user_region_map.
+	Zamień COMPUTE_WH na nazwę swojego warehouse'u.
+	Snowflake stopniowo wymusza MFA dla logowań hasłem, więc przy pierwszym logowaniu 
+	nowy użytkownik może zostać poproszony o skonfigurowanie drugiego składnika.
+*/
