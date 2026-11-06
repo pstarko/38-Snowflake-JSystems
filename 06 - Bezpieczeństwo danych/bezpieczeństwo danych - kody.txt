@@ -1,0 +1,266 @@
+/*
+Fail-Safe i bezpieczeństwo danych w Snowflake
+1. Fail-Safe
+
+	Fail-Safe to ostatnia linia obrony przed utratą danych — mechanizm odzyskiwania awaryjnego, 
+	a nie narzędzie do codziennej pracy z danymi.
+
+Jak to działa?
+	Po wyczerpaniu okresu Time Travel dane nie znikają od razu — dla tabel permanent przechodzą w stan Fail-Safe na 7 dni 
+	(stały, niekonfigurowalny okres).
+	
+Dane aktywne → Time Travel (0-90 dni) → Fail-Safe (7 dni, tylko permanent) → usunięte na stałe
+
+Typ tabeli	Time Travel										Fail-Safe
+PERMANENT	0-1 dzień (Standard) / do 90 dni (Enterprise+)	7 dni
+TRANSIENT	0-1 dzień										brak
+TEMPORARY	0-1 dzień										brak
+
+--Kluczowa różnica: Fail-Safe vs Time Travel
+
+				Time Travel							Fail-Safe
+Kto ma dostęp	Ty sam (SQL)						Tylko Snowflake Support
+Jak odzyskać	UNDROP, AT/BEFORE					Zgłoszenie do Snowflake Support
+Czas odzyskania	natychmiast							godziny/dni (proces ręczny)
+Cel				cofnięcie błędu, audyt, klonowanie	katastrofa (awaria, atak, błąd krytyczny)
+
+To znaczy w praktyce: nie ma żadnej komendy SQL, którą sam odzyskasz dane z Fail-Safe. 
+Musisz otworzyć case u Snowflake Support i poprosić o przywrócenie — to jest mechanizm awaryjny.
+
+--Przykład: użycie Time Travel (to, czego użyjesz w 99% przypadków)
+*/
+-- Cofnięcie przypadkowego DROP
+DROP TABLE alldata;
+
+select * from alldata;
+
+UNDROP TABLE alldata;
+
+-- Odzyskanie stanu tabeli sprzed błędnego UPDATE
+update alldata set lastname = 'xxx' where id=1;
+
+select * from alldata where id = 1;
+
+SELECT * FROM alldata AT (OFFSET => -60);          -- 1 minuta wstecz
+SELECT * FROM alldata BEFORE (STATEMENT => '01c83a19-020b-c08b-0002-75a2010d1186');
+
+-- Przywrócenie danych po awarii przez CTAS
+CREATE OR REPLACE TABLE alldata_recovered AS
+SELECT * FROM alldata AT (TIMESTAMP => '2026-10-01 11:55:00'::TIMESTAMP);
+
+/*
+Fail-Safe uruchamiasz dopiero, gdy przekroczyłeś okno Time Travel i naprawdę potrzebujesz danych sprzed tego okresu — 
+wtedy jedyną drogą jest kontakt ze Snowflake Support.
+
+Koszt
+	Storage w Fail-Safe jest liczony i płatny, tak samo jak Time Travel — to jeden z powodów, 
+	dla których transient/temporary tables (bez Fail-Safe) są tańsze do danych roboczych/staging.
+
+*/
+
+-- Sprawdzenie zużycia storage (w tym Fail-Safe)
+/*
+Co oznaczają kolumny
+    ACTIVE_BYTES: bieżące dane w tabeli.
+    TIME_TRAVEL_BYTES: poprzednie wersje danych trzymane na potrzeby Time Travel.
+    FAILSAFE_BYTES: dane w 7-dniowym Fail-safe. Dla tabel transient i temporary zawsze 0.
+    RETAINED_FOR_CLONE_BYTES: dane usunięte z tej tabeli, ale wciąż potrzebne klonom, które z nich korzystają. Tu widać efekt CLONE z poprzedniego przykładu.
+
+Wszystkie wartości są w bajtach. Żeby dostać GB: ACTIVE_BYTES / POWER(1024, 3) AS ACTIVE_GB.
+*/
+SELECT
+    TABLE_CATALOG,
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    IS_TRANSIENT,
+    ACTIVE_BYTES,
+    TIME_TRAVEL_BYTES,
+    FAILSAFE_BYTES,
+    RETAINED_FOR_CLONE_BYTES
+FROM INFORMATION_SCHEMA.TABLE_STORAGE_METRICS
+WHERE TABLE_NAME = 'ALLDATA';
+
+
+/*
+2. Zasady bezpieczeństwa danych w Snowflake
+a) Kontrola dostępu: RBAC
+	Snowflake używa role-based access control — uprawnienia nadaje się rolom, a role przypisuje użytkownikom 
+	(nigdy uprawnienia bezpośrednio użytkownikowi).
+*/
+
+-- Tworzenie roli i nadanie uprawnień
+CREATE ROLE analyst_ro;
+
+GRANT USAGE ON DATABASE szkolenie TO ROLE analyst_ro;
+GRANT USAGE ON SCHEMA szkolenie.public TO ROLE analyst_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA szkolenie.public TO ROLE analyst_ro;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA szkolenie.public TO ROLE analyst_ro;  -- automatycznie dla nowych tabel
+
+CREATE USER jan_kowalski
+    PASSWORD = 'TymczasoweHaslo#2026a'
+    DEFAULT_ROLE = analyst_ro
+    DEFAULT_WAREHOUSE = COMPUTE_WH;
+
+GRANT ROLE analyst_ro TO USER jan_kowalski;
+
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE analyst_ro; --uprawnienia do roli dla warehouse a nie dla usera
+
+-- Hierarchia ról (dziedziczenie uprawnień w górę)
+GRANT ROLE analyst_ro TO ROLE senior_analyst;
+
+--Dobra praktyka: nadawaj uprawnienia na przyszłe obiekty (FUTURE TABLES/VIEWS) w schemacie, żeby nie trzeba było pamiętać o każdej nowej tabeli.
+-- obiekty, które powstaną w przyszłości
+GRANT SELECT ON FUTURE TABLES IN SCHEMA STARKOTEST.PUBLIC TO ROLE ANALITYK;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA STARKOTEST.PUBLIC TO ROLE ANALITYK
+
+/*
+b) Row Access Policies — bezpieczeństwo na poziomie wiersza
+	Ograniczają, które wiersze widzi dana rola, niezależnie od tego, czy zapytanie idzie przez tabelę czy widok.
+*/
+
+select CURRENT_USER();
+--PSTAROSTA
+
+create table user_region_map (user_name varchar(100), user_region varchar(100));
+
+truncate table user_region_map;
+insert into user_region_map values ('PSTAROSTA','Wielkopolskie'), ('jan_kowalski','Dolnośląskie'), ('PSTAROSTA','Małopolskie');;
+
+select * from user_region_map;
+
+CREATE OR REPLACE ROW ACCESS POLICY rap_region_filter
+AS (region VARCHAR) RETURNS BOOLEAN ->
+    -- administratorzy widzą wszystko
+    EXISTS (
+        SELECT 1
+        FROM user_region_map m
+        WHERE UPPER(m.user_name) = CURRENT_USER()
+          AND m.user_region = region
+    );
+
+drop table sales; 
+
+create table sales (id int, nazwa varchar(100), cena integer, region varchar(100));
+
+insert into sales values (1,'monitor', 2500, 'Wielkopolskie'), (2,'klawiatura', 500, 'Dolnośląskie'), (3,'myszka', 100, 'Małopolskie')
+
+ALTER TABLE sales ADD ROW ACCESS POLICY rap_region_filter ON (region);
+
+select * from sales;
+
+/*
+Efekt: użytkownik z rolą regionalną widzi w SELECT * FROM sales tylko wiersze ze swojego regionu — bez zmiany zapytań w aplikacji.
+*/
+
+/*
+c) Dynamic Data Masking — maskowanie na poziomie kolumny
+	Ukrywa lub maskuje wartości w kolumnie w zależności od roli wywołującego.
+*/
+drop table klienci;
+
+CREATE OR REPLACE TABLE klienci (
+    id     NUMBER,
+    imie   VARCHAR,
+    email  VARCHAR,
+    pesel  VARCHAR
+);
+
+INSERT INTO klienci VALUES
+    (1, 'Jan',   'jan.kowalski@firma.pl', '85010112345'),
+    (2, 'Anna',  'anna.nowak@poczta.pl',  '92051567890'),
+    (3, 'Piotr', 'piotr.wisniewski@mail.com', '78123054321');
+
+
+-- e-mail: pełny dla PII_READER, częściowo ukryty dla reszty
+drop MASKING POLICY mask_email;
+drop masking policy mask_pesel;
+
+CREATE OR REPLACE MASKING POLICY mask_email AS (val VARCHAR) RETURNS VARCHAR ->
+    CASE
+        WHEN IS_ROLE_IN_SESSION('PII_READER') THEN val
+        ELSE REGEXP_REPLACE(val, '^[^@]+', '*****')   -- *****@firma.pl
+    END;
+
+-- PESEL: pełny dla PII_READER, pozostali widzą tylko 4 ostatnie cyfry
+CREATE OR REPLACE MASKING POLICY mask_pesel AS (val VARCHAR) RETURNS VARCHAR ->
+    CASE
+        WHEN IS_ROLE_IN_SESSION('PII_READER') THEN val
+        ELSE '*******' || RIGHT(val, 4)
+    END;
+
+ALTER TABLE klienci MODIFY COLUMN email SET MASKING POLICY mask_email;
+ALTER TABLE klienci MODIFY COLUMN pesel SET MASKING POLICY mask_pesel;
+
+SELECT * FROM klienci;
+
+select current_role();
+
+--rola która zobaczy dane
+CREATE ROLE IF NOT EXISTS PII_READER;
+GRANT ROLE PII_READER TO USER PRZEMEKSTAROSTATRENER;
+
+
+SELECT * FROM klienci;
+--PII_READER zobaczy jan@firma.pl, zwykły user — *****@firma.pl.
+
+
+/*
+d) Object Tagging + polityki oparte na tagach
+	Można oznaczyć kolumny (np. PII, SENSITIVE) i przypisać politykę maskowania do tagu — 
+	działa automatycznie na wszystkich oznaczonych kolumnach, bez ręcznego podpinania w każdej tabeli.
+*/
+CREATE TAG pii_tag;
+ALTER TABLE customers MODIFY COLUMN pesel SET TAG pii_tag = 'high_sensitivity';
+ALTER TAG pii_tag SET MASKING POLICY mask_generic;
+	
+/*
+e) Szyfrowanie danych
+	At rest: wszystkie dane w Snowflake są szyfrowane automatycznie (AES-256), zawsze, bez konfiguracji.
+	In transit: wszystkie połączenia idą przez TLS.
+	Tri-Secret Secure (Business Critical+): własny klucz klienta (Customer-Managed Key) łączony z kluczem Snowflake 
+	— możesz odciąć dostęp do danych, unieważniając swój klucz.
+	
+f) Network Policies
+
+*/	
+CREATE NETWORK POLICY corp_only
+  ALLOWED_IP_LIST = ('203.0.113.0/24')
+  BLOCKED_IP_LIST = ('203.0.113.99');
+
+ALTER USER jan_kowalski SET NETWORK_POLICY = corp_only;
+
+/*
+g) Uwierzytelnianie
+	MFA (Duo), SSO/SAML, key-pair authentication (dla połączeń programistycznych/service accountów zamiast haseł), OAuth.
+
+h) Secure Views/UDF i Data Sharing
+	Jak wspomniałem wcześniej — SECURE VIEW i SECURE FUNCTION ukrywają definicję i logikę przed konsumentem danych. 
+	To podstawa Secure Data Sharing, gdzie udostępniasz dane innemu kontu Snowflake bez kopiowania ich fizycznie 
+	(odbiorca odpytuje Twoje dane bezpośrednio, przez warstwę uprawnień).
+
+i) Audyt i monitoring
+*/
+-- Historia zapytań
+SELECT * FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
+WHERE query_text ILIKE '%alldata%';
+
+-- Kto miał dostęp do czego
+SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY;
+
+-- Historia logowań
+SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY;
+
+/*
+
+3. Podsumowanie: warstwy bezpieczeństwa
+
+Warstwa						Mechanizm
+Sieć						Network Policies, Private Link
+Uwierzytelnianie			MFA, SSO, key-pair auth
+Autoryzacja					RBAC (role, grants)
+Wiersz						Row Access Policies
+Kolumna						Dynamic Data Masking, tag-based masking
+Szyfrowanie					AES-256 at rest, TLS in transit, opcjonalnie Tri-Secret Secure
+Odzyskiwanie				Time Travel → Fail-Safe
+Audyt						QUERY_HISTORY, ACCESS_HISTORY, LOGIN_HISTORY
+*/
