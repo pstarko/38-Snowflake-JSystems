@@ -1,0 +1,119 @@
+CREATE OR REPLACE TABLE orders (
+  order_id NUMBER,
+  customer STRING,
+  order_ts TIMESTAMP_NTZ,
+  items ARRAY
+);
+
+-- Wstawiamy przykładowe wiersze z różną strukturą items
+INSERT INTO orders (order_id, customer, order_ts, items)
+SELECT
+  101, 'ACME', '2025-01-02 10:00:00',
+  PARSE_JSON('[
+    {"sku":"A1","qty":2,"options":["red","XL"]},
+    {"sku":"B7","qty":1}
+  ]')
+UNION ALL
+SELECT
+  102, 'BETA', '2025-01-03 12:30:00',
+  PARSE_JSON('[
+    {"sku":"A1","qty":3,"options":["blue","L"]},
+    {"sku":"C3","qty":5,"options":[]}
+  ]')
+UNION ALL
+SELECT
+  103, 'ACME', '2025-01-04 08:15:00',
+  PARSE_JSON('[]')  -- pusta tablica
+UNION ALL
+SELECT
+  104, 'DELTA', '2025-01-05 16:45:00',
+  PARSE_JSON(null)  -- NULL
+UNION ALL
+SELECT
+  105, 'OMEGA', '2025-01-06 09:05:00',
+  PARSE_JSON('[
+    {"sku":"D9","qty":2,"options":["black"]},
+    {"sku":"B7","qty":4,"options":["green","M"]}
+  ]');
+
+
+select * from orders;
+
+-- Dodatkowo zrobimy tabelę sku_dim do demonstracji joinów po spłaszczeniu:
+
+CREATE OR REPLACE TABLE sku_dim (
+  sku STRING,
+  category STRING,
+  price NUMBER(10,2)
+);
+
+INSERT INTO sku_dim (sku, category, price) VALUES
+  ('A1','apparel',49.99),
+  ('B7','apparel',19.90),
+  ('C3','accessories',9.50),
+  ('D9','shoes',129.00);
+
+SELECT * FROM orders ORDER BY order_id;
+SELECT * FROM sku_dim;
+
+--A1) Rozplątanie tablicy items do wierszy
+SELECT
+  o.order_id,
+  o.customer,
+  f.value:sku::string AS sku,
+  f.value:qty::int    AS qty
+FROM orders o,
+LATERAL FLATTEN(input => o.items) f
+ORDER BY o.order_id, sku;
+
+/*
+f.value to element tablicy (JSON object).
+Rzutujemy typy: ::string, ::int. 
+*/
+
+--Ćwiczenie: Policz liczbę spłaszczonych wierszy versus oryginalna liczba zamówień.
+
+
+
+  
+
+/*
+Część B: Wielopoziomowe zagnieżdżenia (np. options)
+Kolumna items zawiera czasem pole options jako tablicę. Spłaszczymy najpierw items, następnie options
+*/
+
+SELECT
+  o.order_id,
+  f1.value:sku::string AS sku,
+  f1.value:qty::int    AS qty,
+  f2.value::string     AS option_value
+FROM orders o,
+LATERAL FLATTEN(input => o.items) f1,
+LATERAL FLATTEN(input => f1.value:options) f2
+ORDER BY o.order_id, sku, option_value;
+
+--outer - obsługa pustych
+SELECT
+  o.order_id,
+  f1.value:sku::string AS sku,
+  f1.value:qty::int    AS qty,
+  f2.value::string     AS option_value
+FROM orders o,
+LATERAL FLATTEN(input => o.items) f1,
+LATERAL FLATTEN(input => f1.value:options, outer => TRUE) f2
+ORDER BY o.order_id, sku, option_value;
+
+--Agregacje - ilość sztuk per SKU
+WITH flat AS (
+  SELECT
+    f.value:sku::string AS sku,
+    f.value:qty::int    AS qty
+  FROM orders o,
+  LATERAL FLATTEN(input => o.items) f
+)
+SELECT
+  sku,
+  SUM(qty) AS total_qty
+FROM flat
+GROUP BY 1
+ORDER BY total_qty DESC;
