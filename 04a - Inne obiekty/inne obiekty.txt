@@ -1,0 +1,167 @@
+/*
+
+1. Tabele w Snowflake: temporary, transient, permanent
+
+Typ			Czas życia		  Widoczność						Time Travel		Fail-safe
+TEMPORARY	do końca sesji	   tylko sesja, która ją utworzyła	0-1 dzień		brak
+TRANSIENT	do jawnego DROP	  wszyscy z uprawnieniami			0-1 dzień		brak
+PERMANENT	do jawnego DROP	  wszyscy z uprawnieniami			do 90 dni 		(Enterprise+)	7 dni
+
+Tabela tymczasowa zajmuje miejsce (i generuje koszt storage), dopóki sesja trwa. 
+Po jej zamknięciu dane są nieodwracalnie usuwane, bez możliwości odzyskania.
+
+*/
+-- Pusta tabela o zadanej strukturze
+CREATE OR REPLACE TEMPORARY TABLE tmp_orders (
+    order_id    NUMBER,
+    customer_id NUMBER,
+    total       NUMBER(10,2)
+);
+
+-- CTAS: z wyniku zapytania
+CREATE TEMPORARY TABLE tmp_big_alldata AS
+SELECT * FROM alldata WHERE id > 100;
+
+
+-- Kopia struktury innej tabeli (bez danych)
+CREATE TEMPORARY TABLE tmp_copy LIKE alldata;
+
+-- Klon (zero-copy) – tabela tymczasowa może być sklonowana tylko do TEMP lub TRANSIENT
+/*
+CLONE: kopia „zero-copy”
+
+    Snowflake nie kopiuje fizycznie danych. Nowa tabela wskazuje na te same mikropartycje co oryginał, dlatego:
+        klonowanie trwa sekundy nawet dla bardzo dużych tabel i nie zużywa mocy obliczeniowej warehouse'u;
+        na starcie nie płacisz za dodatkowy storage;
+        od chwili utworzenia obie tabele są niezależne. Zmiany w klonie nie wpływają na alldata i odwrotnie. Płacisz tylko za mikropartycje, które zmienisz w jednej z nich.
+
+    Klon dostaje strukturę i dane z momentu utworzenia, w tym klucze klastrowania i domyślne wartości kolumn. 
+    Nie przenoszą się uprawnienia (chyba że dodasz COPY GRANTS) ani historia ładowania plików.
+
+    Istnieje tylko w Twojej bieżącej sesji. Inni użytkownicy, a nawet Ty w innej zakładce czy arkuszu, jej nie zobaczą.
+    Jest automatycznie usuwana po zakończeniu sesji.
+    Nie ma Fail-safe, a Time Travel wynosi maksymalnie 1 dzień, więc nie generuje długoterminowych kosztów przechowywania.
+    Jeśli w schemacie istnieje stała tabela o tej samej nazwie, w Twojej sesji tymczasowa ją „przesłania”.
+*/
+CREATE TEMPORARY TABLE tmp_alldata_clone CLONE alldata;
+
+-- Transient: trwała, ale tańsza (bez Fail-safe)
+CREATE TRANSIENT TABLE stg_alldata (id NUMBER, lastname VARCHAR)
+    DATA_RETENTION_TIME_IN_DAYS = 0;
+	
+/*
+Opcje i cechy tabel tymczasowych:
+	OR REPLACE / IF NOT EXISTS: 	nadpisanie lub pominięcie, jeśli istnieje (nie łącz obu naraz).
+	DATA_RETENTION_TIME_IN_DAYS: 	długość Time Travel (dla temp/transient max 1).
+	CLUSTER BY (kolumna): 			klucz klastrowania. Przydatny tylko przy dużych tabelach.
+	COPY GRANTS: 					przy OR REPLACE zachowuje uprawnienia.
+	COMMENT, TAG, DEFAULT, NOT NULL, AUTOINCREMENT: standardowe opcje kolumn.
+
+	Brak indeksów. Snowflake korzysta z mikropartycji i pruningu, więc na tabelach tymczasowych nie ma czego indeksować.
+	Klucze PK/FK/UNIQUE są tylko informacyjne (nie są wymuszane, poza NOT NULL).
+	Cień nazw: tabela tymczasowa o tej samej nazwie co trwała przesłania ją w danej sesji. Łatwo o pomyłkę, więc warto dawać prefiks tmp_.
+	Brak ON COMMIT. Instrukcje DDL (w tym CREATE TEMP TABLE) robią w Snowflake niejawny commit.
+
+
+Kiedy używać
+	Wynik pośredni używany wielokrotnie w skrypcie lub procedurze (liczysz raz, czytasz kilka razy).
+	Etapy ETL/ELT w Snowflake Scripting, gdzie każdy krok korzysta z poprzedniego.
+	Debugowanie i eksperymenty: bezpieczne, nikt inny tego nie widzi i nic nie zostaje.
+	Gdy CTE byłoby liczone wielokrotnie (Snowflake nie gwarantuje materializacji CTE).
+	
+Uwaga: taski i procedury uruchamiane przez harmonogram działają w osobnych sesjach, 
+więc tabela tymczasowa z jednego uruchomienia nie jest widoczna w następnym. 
+Jeśli potrzebujesz stanu między uruchomieniami, użyj tabeli transient.
+
+*/
+
+/*
+2. Widoki w Snowflake
+
+Są trzy rodzaje: zwykły, secure i materialized. 
+Dodatkowo są widoki tymczasowe i rekurencyjne.
+*/
+
+--zwykły
+CREATE OR REPLACE VIEW v_ep1_alldata
+    COMMENT = 'Email Promotion 1'
+AS
+SELECT *
+FROM alldata
+WHERE emailpromotion = 1;
+
+-- Jawne nazwy kolumn, zachowanie uprawnień, śledzenie zmian
+CREATE OR REPLACE VIEW v_city_counter (city, total_emp)
+    COPY GRANTS
+    --CHANGE_TRACKING = TRUE (nie obsługuje GROUP BY)
+AS
+SELECT city, count(*)
+from alldata
+GROUP BY city;
+
+-- Widok tymczasowy (znika z sesją)
+CREATE TEMPORARY VIEW v_tmp AS SELECT ...;
+
+	
+	
+/*
+Secure View
+
+Ukrywa definicję widoku przed użytkownikami bez roli właściciela i wyłącza pewne optymalizacje, 
+które mogłyby pośrednio ujawnić dane. Jest standardem przy Data Sharing i przy ochronie danych wrażliwych.
+
+Koszt: zapytania mogą być wolniejsze niż na zwykłym widoku, bo optymalizator ma mniej swobody.
+*/
+CREATE OR REPLACE SECURE VIEW v_alldata_safe AS
+SELECT id, lastname
+FROM alldata;   
+
+/*
+Materialized View
+
+Wymaga edycji Enterprise. Snowflake automatycznie i w tle utrzymuje wynik w aktualności 
+(to generuje koszt serverless compute i storage).
+*/
+CREATE MATERIALIZED VIEW mv_alldata
+    --CLUSTER BY (city)
+AS
+SELECT city, count(*) as total_emp
+from alldata
+GROUP BY city;
+
+/*
+Ograniczenia: 
+	tylko jedna tabela (bez JOIN-ów), 
+	ograniczony zestaw funkcji, 
+	brak niektórych konstrukcji (np. funkcje okienkowe, HAVING, ORDER BY). 
+	
+Opłaca się przy rzadko zmienianych, dużych tabelach i powtarzalnych agregacjach.
+*/
+
+
+/*
+3. Alternatywa specyficzna dla Snowflake: Dynamic Tables
+
+Jeśli myślisz o widoku zmaterializowanym, ale z JOIN-ami i bardziej złożoną logiką, warto rozważyć dynamic table. 
+Snowflake sam odświeża ją, by mieściła się w zadanym opóźnieniu.
+*/
+
+CREATE OR REPLACE DYNAMIC TABLE dt_alldata
+    TARGET_LAG = '30 minutes'      -- lub DOWNSTREAM
+    WAREHOUSE  = compute_wh
+AS
+SELECT city, count(*) as total_emp
+from alldata
+GROUP BY city;
+
+
+/*
+4. Który obiekt wybrać
+Potrzeba													Obiekt
+Wynik pośredni w jednej sesji, wiele odczytów				TEMPORARY TABLE
+Stan pośredni między uruchomieniami, bez kosztu Fail-safe	TRANSIENT TABLE
+Uprościć lub zabezpieczyć dostęp							VIEW
+Ukryć definicję, udostępniać dane na zewnątrz				SECURE VIEW
+Szybka agregacja na jednej dużej tabeli						MATERIALIZED VIEW
+Odświeżany wynik z JOIN-ami, pipeline'y						DYNAMIC TABLE
+Mały wynik używany raz										CTE
